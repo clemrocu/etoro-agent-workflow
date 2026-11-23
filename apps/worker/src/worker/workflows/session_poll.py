@@ -13,7 +13,7 @@ from mistralai import workflows
 from mistralai.workflows import workflow
 from pydantic import BaseModel
 
-with workflow.unsafe.imports_passedthrough():
+with workflow.unsafe.imports_passed_through():
     from worker.activities import (
         evaluate,
         manage_positions,
