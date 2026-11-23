@@ -1,4 +1,4 @@
-"""Socle activities: clock, account state, market snapshot, decision, execution, notify.
+"""Socle activities: clock, account state, markets, decision, execution, notify.
 
 All non-deterministic or side-effecting work lives here (Temporal sandbox): the
 workflow bodies only orchestrate. Order-sending activities are single-attempt
@@ -8,8 +8,7 @@ can never double-fire an order. Activities never log credentials.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
-from urllib.parse import quote
+from typing import Any
 
 import httpx
 import structlog
@@ -21,11 +20,15 @@ from worker import etoro as etoro_lib
 from worker import rules, strategy
 from worker.config import SessionConfig
 
-TIMEOUT = timedelta(seconds=90)
+TIMEOUT = timedelta(seconds=120)
 logger = structlog.get_logger("etoro-agent")
 
 PARIS = etoro_lib.PARIS
-PIP = etoro_lib.PIP
+M15 = etoro_lib.M15
+H1 = etoro_lib.H1
+CANDLES_M15 = 60
+CANDLES_H1 = 210          # EMA200 needs 200 closed H1 bars + warm-up margin
+SCAN_PAUSE_S = 0.25       # pacing between instrument reads (shared 60 req/min)
 
 
 # ------------------------------------------------------------------
@@ -72,8 +75,8 @@ async def read_account_state(config: SessionConfig) -> dict[str, Any]:
         return {"read_error": "no eToro credential configured (ETORO_TOKEN or keys)"}
     client = etoro_lib.EtoroClient()
     balance = await client.get_balance()
-    positions = await client.get_positions(config.instrument_id)
-    trades = await client.get_today_trades(config.instrument_id)
+    positions = await client.get_positions()
+    trades = await client.get_today_trades()
     if balance is None or positions is None:
         return {"read_error": "balance or portfolio unreadable", "positions": [], "balance": None,
                 "today_trades": 0, "today_net_pnl": 0.0, "consec_losses": 0, "last_close": None}
@@ -88,24 +91,33 @@ async def read_account_state(config: SessionConfig) -> dict[str, Any]:
 
 
 @workflows.activity(start_to_close_timeout=TIMEOUT)
-async def read_market(config: SessionConfig) -> dict[str, Any]:
-    """Live rate + closed M5/M15 candles for the instrument."""
+async def read_markets(config: SessionConfig) -> dict[int, dict[str, Any]]:
+    """{instrument_id: {ask, bid, m15: [...], h1: [...]}} for the whole universe.
+
+    One batched rates call, then paced per-instrument candle reads; a failing
+    instrument yields a snapshot with a read_error instead of blocking the scan.
+    """
     if not etoro_env.has_auth():
-        return {"read_error": "no eToro credential configured"}
+        return {}
     client = etoro_lib.EtoroClient()
-    rate = await client.get_rate(config.instrument_id)
-    if rate is None:
-        return {"read_error": "rate unreadable"}
-    ask, bid = rate
-    m5 = await client.get_candles(config.instrument_id, "FiveMinutes", 60, etoro_lib.M5)
-    m15 = await client.get_candles(config.instrument_id, "FifteenMinutes", 60, etoro_lib.M15)
-    return {
-        "ask": ask,
-        "bid": bid,
-        "spread_pips": round((ask - bid) / PIP, 2),
-        "m5": m5 or [],
-        "m15": m15 or [],
-    }
+    ids = list(config.instruments)
+    rates = await client.get_rates(ids)
+    markets: dict[int, dict[str, Any]] = {}
+    for iid in ids:
+        snap: dict[str, Any] = {}
+        if iid in rates:
+            snap["ask"], snap["bid"] = rates[iid]
+        else:
+            snap["read_error"] = "rate unreadable"
+        m15 = await client.get_candles(iid, "FifteenMinutes", CANDLES_M15, M15)
+        h1 = await client.get_candles(iid, "OneHour", CANDLES_H1, H1)
+        if m15 is None or h1 is None:
+            snap["read_error"] = snap.get("read_error") or "candles unreadable"
+        snap["m15"] = m15 or []
+        snap["h1"] = h1 or []
+        markets[iid] = snap
+        await asyncio.sleep(SCAN_PAUSE_S)
+    return markets
 
 
 # ------------------------------------------------------------------
@@ -113,30 +125,44 @@ async def read_market(config: SessionConfig) -> dict[str, Any]:
 # ------------------------------------------------------------------
 @workflows.activity(start_to_close_timeout=TIMEOUT)
 async def evaluate(
-    config: SessionConfig, state: dict[str, Any], market: dict[str, Any], now_ctx: dict[str, Any]
+    config: SessionConfig, state: dict[str, Any], markets: dict[int, dict[str, Any]], now_ctx: dict[str, Any]
 ) -> dict[str, Any]:
     """Strategy decision under the guardrails: {action: open|skip, reason, order_spec?}."""
     blocked = rules.entry_blocked_reason(state, now_ctx, config)
     if blocked:
         return {"action": "skip", "reason": f"guardrail: {blocked}"}
-    if market.get("read_error"):
-        return {"action": "skip", "reason": f"guardrail: {market['read_error']}"}
-    if not rules.spread_ok(market["ask"], market["bid"], config):
-        return {"action": "skip", "reason": f"guardrail: spread {market['spread_pips']} pips too wide"}
-    decision = strategy.decide(market, state, config)
+    if not markets:
+        return {"action": "skip", "reason": "guardrail: markets unreadable"}
+    decision = strategy.decide(markets, state, config)
     if decision.action == "skip":
         return {"action": "skip", "reason": decision.reason}
+    snap = markets.get(decision.instrument_id) or {}
+    if snap.get("read_error"):
+        return {"action": "skip", "reason": f"guardrail: market of {decision.symbol} unreadable"}
+    ask, bid = snap["ask"], snap["bid"]
+    if not rules.spread_ok(ask, bid, config):
+        spread_pct = (ask - bid) / ((ask + bid) / 2)
+        return {"action": "skip",
+                "reason": f"guardrail: {decision.symbol} spread {spread_pct:.4%} too wide"}
     direction = decision.direction or "buy"
-    entry_rate = market["ask"] if direction == "buy" else market["bid"]
-    sizing, reason = rules.size_trade(state["balance"], entry_rate, config)
+    entry_rate = ask if direction == "buy" else bid
+    sizing, reason = rules.size_trade(state["balance"], entry_rate, decision.stop_rate, config)
     if sizing is None:
         return {"action": "skip", "reason": f"guardrail: {reason}"}
+    order_spec = rules.build_order_spec(
+        decision.instrument_id or 0, direction, entry_rate, sizing,
+        decision.stop_rate, decision.tp_rate, config,
+    )
     return {
         "action": "open",
+        "instrument_id": decision.instrument_id,
+        "symbol": decision.symbol,
         "direction": direction,
         "entry_rate": entry_rate,
         "sizing": sizing,
-        "order_spec": rules.build_order_spec(direction, entry_rate, sizing, config),
+        "order_spec": order_spec,
+        # known ids: the post-order failsafe must only match NEW positions
+        "known_position_ids": [p["id"] for p in state.get("positions") or []],
     }
 
 
@@ -166,11 +192,13 @@ async def place_entry(config: SessionConfig, decision: dict[str, Any]) -> OrderR
         status, data = await client.call("POST", url_path, body=body, request_id=rid)
     if status != 200:
         # Failsafe: a timeout may still have opened the position; look for it.
-        found = await _detect_new_position(client, config, set(p["id"] for p in []), deadline=8)
+        known = set(decision.get("known_position_ids") or [])
+        found = await _detect_new_position(client, known, deadline=8)
         if found:
             await _notify_http(
                 title="eToro agent: order in timeout, position opened",
-                message=f"Position {found['id']} visible after HTTP {status}. Check the account.",
+                message=(f"Position {found['id']} on {decision.get('symbol')} visible "
+                         f"after HTTP {status}. Check the account."),
                 priority="high", tags="warning",
             )
             return OrderResult(ok=True, position_id=found["id"], halt_session=True,
@@ -178,22 +206,22 @@ async def place_entry(config: SessionConfig, decision: dict[str, Any]) -> OrderR
         return OrderResult(ok=False, halt_session=True,
                            detail=f"order rejected: HTTP {status} {str(data)[:180]}")
     order_id = ((data or {}).get("orderForOpen") or {}).get("orderID")
-    found = await _detect_new_position(client, config, set(), deadline=15)
+    found = await _detect_new_position(client, set(), deadline=15)
     await _notify_http(
         title="eToro agent: position opened",
-        message=(f"{decision['direction'].upper()} {decision['sizing']['units']} units "
-                 f"@ ~{decision['entry_rate']:.5f} (order {order_id}). "
-                 f"TP/SL set per config."),
+        message=(f"{decision['direction'].upper()} {decision.get('symbol')} "
+                 f"{decision['sizing']['units']} units @ ~{decision['entry_rate']:.5f} "
+                 f"(order {order_id}). Structural TP/SL attached."),
         priority="default", tags="chart_with_upwards_trend",
     )
     return OrderResult(ok=True, order_id=order_id, position_id=found["id"] if found else None,
                        detail=f"order {order_id} accepted")
 
 
-async def _detect_new_position(client, config: SessionConfig, pre_ids: set, deadline: float = 15):
+async def _detect_new_position(client, pre_ids: set, deadline: float = 15):
     end = asyncio.get_running_loop().time() + deadline
     while asyncio.get_running_loop().time() < end:
-        positions = await client.get_positions(config.instrument_id)
+        positions = await client.get_positions()
         if positions:
             new = [p for p in positions if p["id"] not in pre_ids]
             if new:
@@ -208,7 +236,7 @@ async def close_position(config: SessionConfig, position: dict[str, Any], reason
 
     client = etoro_lib.EtoroClient()
     path = client._routes["market_close"].format(position_id=position["id"])
-    body = {"InstrumentID": config.instrument_id}
+    body = {"InstrumentID": position["instrument_id"]}
     rid = str(uuidlib.uuid4())
     status, data = await client.call("POST", path, body=body, request_id=rid)
     if status in etoro_lib.RETRYABLE:
@@ -217,51 +245,59 @@ async def close_position(config: SessionConfig, position: dict[str, Any], reason
     if status != 200:
         return OrderResult(ok=False, halt_session=True,
                           detail=f"close of {position['id']} failed: HTTP {status} {str(data)[:180]}")
-    if reason == "softsl":
+    if reason in ("day-stop", "weekend", "time-exit"):
         await _notify_http(
-            title="eToro agent: soft stop applied",
-            message=f"Position {position['id']} closed: price crossed PRU +/- soft SL.",
-            priority="high", tags="warning",
+            title=f"eToro agent: position closed ({reason})",
+            message=(f"Position {position['id']} on instrument {position['instrument_id']} "
+                     f"closed by the {reason} guardrail."),
+            priority="high" if reason == "day-stop" else "default",
+            tags="warning" if reason == "day-stop" else "no_entry_sign",
         )
     return OrderResult(ok=True, position_id=position["id"], detail=f"closed ({reason})")
 
 
 @workflows.activity(start_to_close_timeout=TIMEOUT)
 async def manage_positions(
-    config: SessionConfig, state: dict[str, Any], market: dict[str, Any], now_ctx: dict[str, Any]
+    config: SessionConfig, state: dict[str, Any], now_ctx: dict[str, Any]
 ) -> dict[str, Any]:
-    """Soft stops + forced close + day stop: returns what happened, never raises."""
+    """Day stop, weekend flat, time exit: {closed, events, halted}. Never raises."""
     events: list[str] = []
     positions = state.get("positions") or []
     halted = False
     if not positions:
         return {"closed": [], "events": [], "halted": False}
-    if market.get("read_error"):
-        return {"closed": [], "events": ["market unreadable: stops not managed this poll"],
-                "halted": False}
-    if rules.past_force_close(now_ctx, config):
+
+    async def close_all(reason: str) -> list[int]:
+        nonlocal halted
+        closed = []
         for p in positions:
-            res = await close_position(config, p, "force")
-            events.append(f"forced close {p['id']}: {'ok' if res.ok else res.detail}")
+            res = await close_position(config, p, reason)
+            closed.append(p["id"])
+            events.append(f"{reason} close {p['id']}: {'ok' if res.ok else res.detail}")
             halted = halted or (not res.ok and res.halt_session)
-        return {"closed": [p["id"] for p in positions], "events": events, "halted": halted}
+        return closed
+
     if rules.day_stop_hit(state, config):
-        for p in positions:
-            res = await close_position(config, p, "day-stop")
-            events.append(f"day-stop close {p['id']}: {'ok' if res.ok else res.detail}")
-            halted = halted or (not res.ok and res.halt_session)
+        closed = await close_all("day-stop")
         await _notify_http(
             title="eToro agent: daily stop",
-            message=f"Day P/L {state.get('today_net_pnl')} reached the stop: positions closed, session over.",
+            message=(f"Day P/L {state.get('today_net_pnl')} reached the stop: "
+                     f"all positions closed, no more entries today."),
             priority="high", tags="warning",
         )
-        return {"closed": [p["id"] for p in positions], "events": events, "halted": True}
-    hits = rules.soft_stop_hits(positions, market["ask"], market["bid"], config)
-    for p in hits:
-        res = await close_position(config, p, "softsl")
-        events.append(f"soft stop {p['id']}: {'ok' if res.ok else res.detail}")
+        return {"closed": closed, "events": events, "halted": True}
+
+    if rules.weekend_flat_due(now_ctx, config):
+        closed = await close_all("weekend")
+        return {"closed": closed, "events": events, "halted": halted}
+
+    for p in rules.time_exit_positions(positions, now_ctx, config):
+        res = await close_position(config, p, "time-exit")
+        events.append(f"time-exit close {p['id']}: {'ok' if res.ok else res.detail}")
         halted = halted or (not res.ok and res.halt_session)
-    return {"closed": [p["id"] for p in hits], "events": events, "halted": halted}
+    # All closed ids from the time exit (computed twice: determinism preserves order).
+    closed = [p["id"] for p in rules.time_exit_positions(positions, now_ctx, config)]
+    return {"closed": closed, "events": events, "halted": halted}
 
 
 # ------------------------------------------------------------------
@@ -269,16 +305,11 @@ async def manage_positions(
 # ------------------------------------------------------------------
 def _header_value(value: str) -> str:
     """httpx refuses non-ASCII header values: encode them as %XX UTF-8 (ntfy native)."""
-    out = []
-    for ch in value.encode("utf-8") if not value.isascii() else value.encode("ascii"):
-        if isinstance(ch, int):  # bytes iteration
-            if ch < 0x80:
-                out.append(chr(ch))
-            else:
-                out.append(f"%{ch:02X}")
-        else:
-            out.append(ch)
-    return "".join(out)
+    if value.isascii():
+        return value
+    return "".join(
+        chr(b) if b < 0x80 else f"%{b:02X}" for b in value.encode("utf-8")
+    )
 
 
 async def _notify_http(title: str, message: str, priority: str = "default", tags: str = "") -> dict[str, Any]:
@@ -297,7 +328,7 @@ async def _notify_http(title: str, message: str, priority: str = "default", tags
                 "Title": _header_value(title),
                 "Priority": priority,
                 "Tags": tags,
-                "User-Agent": "etoro-agent-workflow/1.0",
+                "User-Agent": "etoro-agent-workflow/2.0",
             },
         )
     return {"delivered": res.status_code == 200, "http_status": res.status_code}

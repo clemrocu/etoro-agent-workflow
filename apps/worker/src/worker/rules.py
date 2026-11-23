@@ -1,15 +1,14 @@
-"""Pure guardrails: window, day stop, pauses, limits, soft SL and sizing.
+"""Pure guardrails: windows, day stop, pauses, limits, swing exits and sizing.
 
-Every function here is deterministic and side-effect free: it computes what the
-session may or must do from the account state and the clock context returned by
-activities. This module is the project's core risk surface: change it with care.
+Every function here is deterministic and side-effect free: it computes what
+the session may or must do from the account state and the clock context.
+This module is the project's core risk surface: change it with care.
 """
 
 import math
+from datetime import datetime, timedelta
 
 from worker.config import SessionConfig
-
-PIP = 0.0001
 
 
 def in_trading_window(now_ctx: dict, config: SessionConfig) -> bool:
@@ -21,10 +20,11 @@ def in_trading_window(now_ctx: dict, config: SessionConfig) -> bool:
     return config.window_start_min <= now_ctx["minute_of_day"] <= config.last_entry_min
 
 
-def past_force_close(now_ctx: dict, config: SessionConfig) -> bool:
-    if config.force_window:
+def weekend_flat_due(now_ctx: dict, config: SessionConfig) -> bool:
+    """True when everything must be closed before the weekend (Friday evening)."""
+    if config.force_window or not config.weekend_flat:
         return False
-    return now_ctx["minute_of_day"] >= config.force_close_min
+    return now_ctx["weekday"] == 4 and now_ctx["minute_of_day"] >= config.friday_flat_min
 
 
 def day_stop_hit(state: dict, config: SessionConfig) -> bool:
@@ -43,8 +43,6 @@ def paused_after_losses(now_ctx: dict, last_close: str | None, config: SessionCo
     """True during the cooldown that follows the last loss after a losing streak."""
     if not last_close:
         return False
-    from datetime import datetime, timedelta
-
     last = datetime.fromisoformat(last_close)
     now = datetime.fromisoformat(now_ctx["iso"])
     return now < last + timedelta(minutes=config.pause_after_losses_min)
@@ -62,7 +60,7 @@ def entry_blocked_reason(state: dict, now_ctx: dict, config: SessionConfig) -> s
     if len(state.get("positions") or []) >= config.max_open_positions:
         return f"max {config.max_open_positions} open positions reached"
     if not in_trading_window(now_ctx, config):
-        return "outside the entry window"
+        return "outside the session window"
     streak = state.get("consec_losses", 0)
     if streak >= config.max_consec_losses and paused_after_losses(
         now_ctx, state.get("last_close"), config
@@ -71,25 +69,44 @@ def entry_blocked_reason(state: dict, now_ctx: dict, config: SessionConfig) -> s
     return None
 
 
-def soft_stop_hits(positions: list[dict], ask: float, bid: float, config: SessionConfig) -> list[dict]:
-    """Positions whose soft stop level is breached at the current price."""
+def instrument_held(state: dict, instrument_id: int) -> bool:
+    """One position per instrument (config.max_positions_per_instrument == 1)."""
+    return any(p.get("instrument_id") == instrument_id for p in state.get("positions") or [])
+
+
+def spread_ok(ask: float, bid: float, config: SessionConfig) -> bool:
+    mid = (ask + bid) / 2
+    if mid <= 0:
+        return False
+    return (ask - bid) / mid <= config.max_spread_pct
+
+
+def time_exit_positions(positions: list[dict], now_ctx: dict, config: SessionConfig) -> list[dict]:
+    """Positions held too long (opened_at parsing failure keeps the position)."""
     out = []
+    now = datetime.fromisoformat(now_ctx["iso"])
     for p in positions or []:
-        if p.get("is_buy"):
-            soft = p["open_rate"] - config.soft_sl_pips * PIP
-            hit = bid <= soft
-        else:
-            soft = p["open_rate"] + config.soft_sl_pips * PIP
-            hit = ask >= soft
-        if hit:
-            out.append({**p, "soft_rate": round(soft, 5)})
+        opened = p.get("opened_at")
+        if not opened:
+            continue
+        try:
+            start = datetime.fromisoformat(str(opened).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if now - start > timedelta(hours=config.max_holding_hours):
+            out.append(p)
     return out
 
 
-def size_trade(balance: float, entry_rate: float, config: SessionConfig) -> tuple[dict | None, str | None]:
+def size_trade(
+    balance: float, entry_rate: float, stop_rate: float, config: SessionConfig
+) -> tuple[dict | None, str | None]:
     """(order sizing | None, reason | None): risk-based units under the exposure rule."""
+    dist = abs(entry_rate - stop_rate)
+    if dist <= 0:
+        return None, "non-positive stop distance"
     risk_usd = balance * config.risk_per_trade
-    units = math.floor(risk_usd / (config.soft_sl_pips * PIP))
+    units = math.floor(risk_usd / dist)
     if units <= 0:
         return None, "balance/risk too low for one unit"
     exposure = units * entry_rate
@@ -102,20 +119,25 @@ def size_trade(balance: float, entry_rate: float, config: SessionConfig) -> tupl
     return None, f"margin above {config.margin_cap_ratio:.0%} of the balance even at max leverage"
 
 
-def spread_ok(ask: float, bid: float, config: SessionConfig) -> bool:
-    return (ask - bid) / PIP <= config.spread_max_pips
-
-
-def build_order_spec(direction: str, entry_rate: float, sizing: dict, config: SessionConfig) -> dict:
+def build_order_spec(
+    instrument_id: int, direction: str, entry_rate: float, sizing: dict,
+    stop_rate: float, tp_rate: float, config: SessionConfig,
+) -> dict:
     """The body of a market-open order, eToro public API layout."""
     is_buy = direction == "buy"
-    tp = round(entry_rate + (config.tp_pips * PIP if is_buy else -config.tp_pips * PIP), 5)
-    sl = round(entry_rate * (1 - config.broker_sl_pct if is_buy else 1 + config.broker_sl_pct), 5)
+    # Net broker SL: the tighter of the structural stop and the 2 % net.
+    # (If the structural stop sits beyond 2 %, the net caps it. If eToro's own
+    # minimum SL distance is wider than what we ask, eToro widens it itself.)
+    max_sl = entry_rate * (1 - config.broker_sl_pct if is_buy else 1 + config.broker_sl_pct)
+    if is_buy:
+        sl = max(stop_rate, max_sl)      # both sit below entry: keep the closest
+    else:
+        sl = min(stop_rate, max_sl)      # both sit above entry: keep the closest
     return {
-        "InstrumentID": config.instrument_id,
+        "InstrumentID": instrument_id,
         "IsBuy": is_buy,
         "Leverage": sizing["leverage"],
         "Amount": sizing["amount_usd"],
-        "StopLossRate": sl,
-        "TakeProfitRate": tp,
+        "StopLossRate": round(sl, 6),
+        "TakeProfitRate": round(tp_rate, 6),
     }

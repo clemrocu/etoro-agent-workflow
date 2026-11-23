@@ -15,7 +15,8 @@ class Env(BaseEnv):
     # (scopes etoro-public:trade.real:read/write). "demo": the /demo routes.
     etoro_account: str = "real"
     etoro_base_url: str = "https://public-api.etoro.com/api/v1"
-    # Bearer token = the eToro agent portfolio user token (visible once at creation).
+    # Agent-portfolio user token (visible once at creation). It is an API user
+    # token: it travels in the x-user-key header, never as an OAuth Bearer.
     etoro_token: Annotated[str | None, WorkspaceSecret()] = None
     # Alternative auth: key pair x-user-key / x-api-key (own account).
     etoro_user_key: Annotated[str | None, WorkspaceSecret()] = None

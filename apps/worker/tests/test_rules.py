@@ -1,14 +1,14 @@
-"""Pure stdlib checks of the guardrail surface: run with `python3 tests/test_rules.py`.
+"""Pure checks of the guardrail surface: run with `python3 tests/test_rules.py`.
 
-No pytest, no dependency: the point is to keep the risk-surface code regression-checked
-in one command from any environment.
+No pytest, no dependency beyond pydantic (config models): the point is to keep
+the risk-surface code regression-checked in one command from any environment.
 """
 
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "packages", "py"))
+_ROOT = os.path.dirname(__file__)
+sys.path.insert(0, os.path.join(_ROOT, "..", "src"))
 
 from worker.config import SessionConfig  # noqa: E402
 from worker import rules  # noqa: E402
@@ -23,31 +23,35 @@ def check(name):
     return deco
 
 
-def now_ctx(minute_of_day, weekday=0):
-    return {"minute_of_day": minute_of_day, "weekday": weekday, "iso": "2026-11-23T15:00:00+01:00"}
+def now_ctx(minute_of_day, weekday=0, iso="2026-11-23T15:00:00+01:00"):
+    return {"minute_of_day": minute_of_day, "weekday": weekday, "iso": iso}
 
 
-@check("entry window: inside/outside")
+@check("entry window: inside/outside (swing 01:00-22:15 Paris)")
 def _():
     cfg = SessionConfig()
-    assert rules.in_trading_window(now_ctx(14 * 60 + 45), cfg)
-    assert not rules.in_trading_window(now_ctx(12 * 60), cfg)
-    assert not rules.in_trading_window(now_ctx(16 * 60 + 10), cfg)
-    assert not rules.in_trading_window(now_ctx(15 * 60), weekday=5)
+    assert rules.in_trading_window(now_ctx(8 * 60), cfg)
+    assert rules.in_trading_window(now_ctx(22 * 60 + 15), cfg)
+    assert not rules.in_trading_window(now_ctx(0 * 60 + 30), cfg)
+    assert not rules.in_trading_window(now_ctx(22 * 60 + 16), cfg)
+    assert not rules.in_trading_window(now_ctx(8 * 60, weekday=5), cfg), "Saturday"
+    assert not rules.in_trading_window(now_ctx(8 * 60, weekday=6), cfg), "Sunday"
 
 
 @check("force_window overrides the clock")
 def _():
     cfg = SessionConfig(force_window=True)
     assert rules.in_trading_window(now_ctx(3 * 60), cfg)
+    assert not rules.weekend_flat_due(now_ctx(22 * 60, weekday=4), cfg)
 
 
-@check("forced close boundary")
+@check("weekend flat: due Friday 21:45+, not before, not other days")
 def _():
     cfg = SessionConfig()
-    assert not rules.past_force_close(now_ctx(16 * 60), cfg)
-    assert rules.past_force_close(now_ctx(16 * 60 + 15), cfg)
-    assert rules.past_force_close(now_ctx(23 * 60), cfg)
+    assert rules.weekend_flat_due(now_ctx(21 * 60 + 45, weekday=4), cfg)
+    assert rules.weekend_flat_due(now_ctx(23 * 60, weekday=4), cfg)
+    assert not rules.weekend_flat_due(now_ctx(21 * 60 + 44, weekday=4), cfg)
+    assert not rules.weekend_flat_due(now_ctx(22 * 60, weekday=1), cfg)
 
 
 @check("daily stop hits at -1% of the day's start balance")
@@ -60,93 +64,129 @@ def _():
     assert not rules.day_stop_hit({"balance": None, "today_net_pnl": -50.0}, cfg)
 
 
-@check("max positions blocks entry")
+@check("cooldown after a losing streak, not after a win")
+def _():
+    cfg = SessionConfig()  # max_consec_losses=3, pause 240 min
+    ctx = now_ctx(15 * 60)
+    losing = {"consec_losses": 3, "last_close": "2026-11-23T13:30:00+01:00"}
+    assert rules.paused_after_losses(ctx, losing["last_close"], cfg)
+    recovered = {"consec_losses": 3, "last_close": "2026-11-23T10:30:00+01:00"}
+    assert not rules.paused_after_losses(ctx, recovered["last_close"], cfg)
+    assert not rules.paused_after_losses(ctx, None, cfg)
+
+
+@check("entry_blocked_reason: every blocking guardrail")
 def _():
     cfg = SessionConfig()
-    state = {"positions": [{"id": 1}, {"id": 2}], "today_trades": 0, "consec_losses": 0}
-    reason = rules.entry_blocked_reason(state, now_ctx(15 * 60), cfg)
-    assert reason and "open positions" in reason
+    ok_state = {"balance": 10000.0, "positions": [], "today_trades": 0,
+                "today_net_pnl": 0.0, "consec_losses": 0}
+    assert rules.entry_blocked_reason(ok_state, now_ctx(15 * 60), cfg) is None
+    assert "unreadable" in rules.entry_blocked_reason(
+        {**ok_state, "read_error": "x"}, now_ctx(15 * 60), cfg)
+    assert "daily stop" in rules.entry_blocked_reason(
+        {**ok_state, "today_net_pnl": -200.0}, now_ctx(15 * 60), cfg)
+    assert "max 4 trades/day" in rules.entry_blocked_reason(
+        {**ok_state, "today_trades": 4}, now_ctx(15 * 60), cfg)
+    assert "open positions" in rules.entry_blocked_reason(
+        {**ok_state, "positions": [{"id": 1}, {"id": 2}, {"id": 3}]},
+        now_ctx(15 * 60), cfg)
+    assert "window" in rules.entry_blocked_reason(ok_state, now_ctx(23 * 60), cfg)
+    streak = {**ok_state, "consec_losses": 3,
+              "last_close": "2026-11-23T14:30:00+01:00"}
+    assert "cooldown" in rules.entry_blocked_reason(streak, now_ctx(15 * 60), cfg)
 
 
-@check("max trades/day blocks entry")
+@check("one position per instrument")
+def _():
+    state = {"positions": [{"id": 1, "instrument_id": 1}, {"id": 2, "instrument_id": 32}]}
+    assert rules.instrument_held(state, 1)
+    assert rules.instrument_held(state, 32)
+    assert not rules.instrument_held(state, 18)
+
+
+@check("spread filter at the 0.05% boundary")
+def _():
+    cfg = SessionConfig()  # max_spread_pct 0.0005
+    assert rules.spread_ok(1.10005, 1.10000, cfg)  # 0.000045 relative
+    assert not rules.spread_ok(1.10500, 1.10000, cfg)  # ~0.0045
+    assert not rules.spread_ok(0.0, 0.0, cfg)
+
+
+@check("time exit: past max_holding_hours, tolerant to bad timestamps")
+def _():
+    cfg = SessionConfig()  # 96 h
+    ctx = now_ctx(15 * 60, iso="2026-11-23T15:00:00+01:00")
+    old = {"id": 1, "opened_at": "2026-11-18T15:00:00+01:00"}  # 5 days: > 96 h
+    fresh = {"id": 2, "opened_at": "2026-11-23T14:00:00+01:00"}
+    bad = {"id": 3, "opened_at": "not-a-date"}
+    none_ = {"id": 4, "opened_at": None}
+    out = rules.time_exit_positions([old, fresh, bad, none_], ctx, cfg)
+    assert [p["id"] for p in out] == [1]
+
+
+@check("sizing: risk 0.5% -> units, min exposure, margin cap")
 def _():
     cfg = SessionConfig()
-    state = {"positions": [], "today_trades": 15, "consec_losses": 0}
-    reason = rules.entry_blocked_reason(state, now_ctx(15 * 60), cfg)
-    assert reason and "trades" in reason
-
-
-@check("consecutive-loss cooldown blocks then releases")
-def _():
-    cfg = SessionConfig()
-    close_iso = "2026-11-23T15:40:00+01:00"
-    state = {"positions": [], "today_trades": 1, "consec_losses": 3, "last_close": close_iso}
-    assert rules.paused_after_losses(now_ctx(15 * 60), close_iso, cfg)
-    assert not rules.paused_after_losses(now_ctx(16 * 30), close_iso, cfg)
-    reason = rules.entry_blocked_reason(state, now_ctx(15 * 60), cfg)
-    assert reason and "cooldown" in reason
-    reason2 = rules.entry_blocked_reason(state, now_ctx(16 * 30), cfg)
-    assert reason2 is None
-
-
-@check("soft stop detection, long and short")
-def _():
-    cfg = SessionConfig()
-    long_pos = {"id": 1, "is_buy": True, "open_rate": 1.1000, "units": 1000}
-    short_pos = {"id": 2, "is_buy": False, "open_rate": 1.1000, "units": 1000}
-    hits = rules.soft_stop_hits([long_pos, short_pos], ask=1.1017, bid=1.0996, config=cfg)
-    assert [h["id"] for h in hits] == [2]  # short hit: ask >= open + 6 pips; long survives: bid > open - 6 pips
-    hits2 = rules.soft_stop_hits([long_pos], ask=1.1050, bid=1.1048, config=cfg)
-    assert hits2 == []
-
-
-@check("sizing: risk 0.5% of 100k, soft SL 6 pips -> units, exposure minimum, margin cap")
-def _():
-    cfg = SessionConfig()
-    sizing, reason = rules.size_trade(100_000.0, 1.09, cfg)
+    # balance 10000, risk 50 USD, stop distance 0.0150 -> 3333 units @ 1.1050
+    sizing, reason = rules.size_trade(10000.0, 1.1050, 1.0900, cfg)
     assert sizing is not None, reason
-    assert sizing["units"] == 833  # 500 USD / 0.0006 -> 833.3.. floor
-    exposure = 833 * 1.09
-    assert sizing["leverage"] == 1  # exposure ~908 > 50% of 100k only if... check explicit
-    assert sizing["amount_usd"] == round(exposure / sizing["leverage"], 2)
-    tiny, reason2 = rules.size_trade(150.0, 1.09, cfg)
-    assert tiny is None and "exposure" in reason2
+    assert sizing["units"] == 3333
+    assert sizing["leverage"] in cfg.allowed_leverages
+    assert sizing["amount_usd"] * sizing["leverage"] >= 10000.0 * 0.25  # exposure sane
+    # stop so close that risk-based units explode the margin even at max leverage
+    sizing2, reason2 = rules.size_trade(10000.0, 1.1050, 1.1045, cfg)
+    assert sizing2 is None and "margin" in reason2
+    # zero stop distance
+    sizing3, reason3 = rules.size_trade(10000.0, 1.1050, 1.1050, cfg)
+    assert sizing3 is None and "stop distance" in reason3
 
 
-@check("order spec: TP/SL on the right side of the entry")
+@check("build_order_spec: structural SL, net 2% cap, eToro layout")
 def _():
     cfg = SessionConfig()
-    spec = rules.build_order_spec("buy", 1.0950, {"leverage": 5, "amount_usd": 200.0, "units": 833}, cfg)
-    assert spec["IsBuy"] is True and spec["InstrumentID"] == 1
-    assert spec["TakeProfitRate"] == round(1.0960, 5)
-    assert spec["StopLossRate"] == round(1.0950 * 0.99, 5)
-    spec2 = rules.build_order_spec("sell", 1.0950, {"leverage": 5, "amount_usd": 200.0, "units": 833}, cfg)
-    assert spec2["TakeProfitRate"] == round(1.0940, 5)
-    assert spec2["StopLossRate"] == round(1.0950 * 1.01, 5)
+    sizing = {"leverage": 5, "amount_usd": 2200.0, "units": 3333}
+    # buy @1.10, structural stop -1%: closer than the 2% net cap -> structural kept
+    spec = rules.build_order_spec(1, "buy", 1.1000, sizing, 1.0890, 1.1220, cfg)
+    assert spec == {
+        "InstrumentID": 1, "IsBuy": True, "Leverage": 5, "Amount": 2200.0,
+        "StopLossRate": 1.089, "TakeProfitRate": 1.122,
+    }
+    # buy @1.10, structural stop -5%: capped by the 2% net SL
+    spec2 = rules.build_order_spec(1, "buy", 1.1000, sizing, 1.0450, 1.2100, cfg)
+    assert spec2["StopLossRate"] == 1.078
+    # sell @1.10, structural stop above entry: closest of structural / +2%
+    spec3 = rules.build_order_spec(32, "sell", 1.1000, sizing, 1.1180, 1.0520, cfg)
+    assert spec3["IsBuy"] is False
+    assert spec3["StopLossRate"] == 1.118
+    assert spec3["TakeProfitRate"] == 1.052
 
 
-@check("spread filter")
+@check("weekly rhythm sanity: window covers all sessions")
 def _():
     cfg = SessionConfig()
-    assert rules.spread_ok(1.09607, 1.09599, cfg)  # 0.8 pips
-    assert not rules.spread_ok(1.0975, 1.0950, cfg)
+    assert cfg.window_start_min == 60          # Asia open ~01:00 Paris
+    assert cfg.weekdays == (0, 1, 2, 3, 4)
+    assert cfg.friday_flat_min < cfg.window_end_min
+    assert cfg.max_holding_hours >= 24        # swing: multi-day holds allowed
+    assert cfg.daily_stop_pct < 0 and cfg.risk_per_trade <= 0.005
 
 
-def main():
-    failures = 0
+def main() -> int:
+    failed = 0
     for name, fn in CHECKS:
         try:
             fn()
-            print(f"PASS {name}")
+            print(f"ok    - {name}")
         except AssertionError as e:
-            failures += 1
-            print(f"FAIL {name}: {e}")
+            failed += 1
+            print(f"FAIL  - {name}: {e or 'assertion'}")
         except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"ERROR {name}: {e}")
-    print(f"\n{len(CHECKS) - failures}/{len(CHECKS)} checks passed")
-    return 1 if failures else 0
+            failed += 1
+            print(f"ERROR - {name}: {type(e).__name__}: {e}")
+    else:
+        print(f"\n{len(CHECKS) - failed}/{len(CHECKS)} checks passed")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
