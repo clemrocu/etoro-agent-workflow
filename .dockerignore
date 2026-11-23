@@ -1,0 +1,36 @@
+**/node_modules
+.git
+
+**/dist
+**/build
+**/.next
+**/.nuxt
+**/.output
+**/.svelte-kit
+**/.astro
+
+**/.wrangler
+**/.alchemy
+**/.expo
+**/.vercel
+*.log
+
+# Python virtualenvs, caches and build artefacts (the images build their own .venv).
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/.ruff_cache
+**/.pytest_cache
+**/.mypy_cache
+coverage
+.coverage*
+**/coverage.xml
+
+# Secrets stay out of image layers; runtime configuration is injected by the selected launcher.
+**/.env
+**/.env.*
+!**/.env.example
+
+# Re-exclude node_modules, and KEEP THIS LAST: .dockerignore is last-match-wins.
+**/node_modules/**
+**/.venv/**

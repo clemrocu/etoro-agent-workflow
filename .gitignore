@@ -1,0 +1,32 @@
+# Environment variables
+.env
+.env*.local
+
+# Python / uv
+.venv
+**/.venv
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# IDEs and editors
+.vscode/*
+!.vscode/settings.json
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+/logs/
+*.log
+
+# Misc
+*.tgz
+.cache
+/tmp/
+/temp/
+/ingest/

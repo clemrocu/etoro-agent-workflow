@@ -1,0 +1,41 @@
+name: socle checks
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  pure-checks:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: socle-checks
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Wait for the lock (committed by generate-uv-lock on pyproject pushes)
+        run: |
+          git ls-remote origin main >/dev/null 2>&1 || true
+          for i in $(seq 1 12); do
+            git fetch origin main --depth 1 >/dev/null 2>&1 || true
+            if git cat-file -e origin/main:uv.lock 2>/dev/null; then
+              git checkout origin/main -- uv.lock
+              echo "uv.lock retrieved"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::uv.lock not yet on main; pure checks run compile-only this time"
+      - name: Compile every module
+        run: python3 -m compileall -q apps packages
+      - name: Pure guardrail checks
+        run: |
+          if [ -f uv.lock ]; then
+            bash tools/uv.sh sync --all-packages --frozen --no-dev
+            ./.venv/bin/python apps/worker/tests/test_rules.py
+          else
+            echo "uv.lock absent; compile-only pass"
+          fi
