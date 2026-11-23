@@ -28,7 +28,8 @@ M15 = etoro_lib.M15
 H1 = etoro_lib.H1
 CANDLES_M15 = 60
 CANDLES_H1 = 210          # EMA200 needs 200 closed H1 bars + warm-up margin
-SCAN_PAUSE_S = 0.25       # pacing between instrument reads (shared 60 req/min)
+SCAN_PAUSE_S = 1.2        # pacing between instrument reads (shared 60 req/min:
+                           # ~33 req/poll -> peak ~52/min incl. account reads)
 
 
 # ------------------------------------------------------------------
