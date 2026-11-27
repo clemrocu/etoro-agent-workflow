@@ -34,6 +34,5 @@ jobs:
           code=$?
           if [ "$code" -ne 0 ]; then
             echo "::warning::uv sync --frozen exits $code (pre-existing failure kept for diagnosis; the deployment build remains the gate) - tail:"
-            printf '%s
-' "$out" | tail -20
+            echo "$out" | tail -20
           fi
