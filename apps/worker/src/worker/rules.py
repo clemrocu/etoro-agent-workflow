@@ -74,11 +74,13 @@ def instrument_held(state: dict, instrument_id: int) -> bool:
     return any(p.get("instrument_id") == instrument_id for p in state.get("positions") or [])
 
 
-def spread_ok(ask: float, bid: float, config: SessionConfig) -> bool:
-    mid = (ask + bid) / 2
-    if mid <= 0:
+def spread_ok(ask: float, bid: float, entry_rate: float, stop_rate: float, config: SessionConfig) -> bool:
+    """v2a per-trade cost filter: the spread must stay under a fraction of the
+    structural stop distance (the cost is capped relative to the risk R)."""
+    dist = abs(entry_rate - stop_rate)
+    if dist <= 0:
         return False
-    return (ask - bid) / mid <= config.max_spread_pct
+    return (ask - bid) <= config.max_spread_of_stop * dist
 
 
 def time_exit_positions(positions: list[dict], now_ctx: dict, config: SessionConfig) -> list[dict]:

@@ -104,12 +104,29 @@ def _():
     assert not rules.instrument_held(state, 18)
 
 
-@check("spread filter at the 0.05% boundary")
+@check("v2a spread filter: spread <= 10% of the stop distance")
 def _():
-    cfg = SessionConfig()  # max_spread_pct 0.0005
-    assert rules.spread_ok(1.10005, 1.10000, cfg)  # 0.000045 relative
-    assert not rules.spread_ok(1.10500, 1.10000, cfg)  # ~0.0045
-    assert not rules.spread_ok(0.0, 0.0, cfg)
+    cfg = SessionConfig()  # max_spread_of_stop 0.10
+    # spread 0.0010 vs stop distance 0.0150 -> 6.7 % of R: ok
+    assert rules.spread_ok(1.1000, 1.0990, 1.1000, 1.0850, cfg)
+    # spread 0.0020 vs 0.0150 -> 13.3 % of R: too expensive
+    assert not rules.spread_ok(1.1000, 1.0980, 1.1000, 1.0850, cfg)
+    # degenerate stop distance: never trade
+    assert not rules.spread_ok(1.1000, 1.0999, 1.1000, 1.1000, cfg)
+
+
+@check("v2a universe: 17 instruments, config and pullback.UNIVERSE in sync")
+def _():
+    from worker import pullback
+    cfg = SessionConfig()
+    assert len(cfg.instruments) == 17
+    assert set(cfg.instruments) == set(pullback.UNIVERSE)
+    for iid in (3, 17, 27):  # NZDUSD, OIL, SPX500 (v2a additions)
+        assert iid in cfg.instruments
+    assert 40 not in cfg.instruments  # PLATINUM: excluded by the cost verdict
+    assert pullback.UNIVERSE[27] == "SPX500"
+    assert pullback.UNIVERSE[17] == "OIL"
+    assert pullback.UNIVERSE[3] == "NZDUSD"
 
 
 @check("time exit: past max_holding_hours, tolerant to bad timestamps")

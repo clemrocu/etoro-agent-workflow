@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from env.etoro import env as etoro_env
 from worker import etoro as etoro_lib
-from worker import rules, strategy
+from worker import pullback, rules, strategy
 from worker.config import SessionConfig
 
 TIMEOUT = timedelta(seconds=120)
@@ -29,7 +29,7 @@ H1 = etoro_lib.H1
 CANDLES_M15 = 60
 CANDLES_H1 = 210          # EMA200 needs 200 closed H1 bars + warm-up margin
 SCAN_PAUSE_S = 1.2        # pacing between instrument reads (shared 60 req/min:
-                           # ~33 req/poll -> peak ~52/min incl. account reads)
+                           # 17 H1 + rates + few M15 -> worst case ~38 req/poll)
 
 
 # ------------------------------------------------------------------
@@ -95,8 +95,12 @@ async def read_account_state(config: SessionConfig) -> dict[str, Any]:
 async def read_markets(config: SessionConfig) -> dict[int, dict[str, Any]]:
     """{instrument_id: {ask, bid, m15: [...], h1: [...]}} for the whole universe.
 
-    One batched rates call, then paced per-instrument candle reads; a failing
-    instrument yields a snapshot with a read_error instead of blocking the scan.
+    v2a two-pass scan: one batched rates call, then a paced H1 read per
+    instrument; the M15 read (the expensive half) only happens where the H1
+    trend is aligned and the price sits near the pullback zone
+    (pullback.near_pullback_zone). A failing instrument yields a snapshot
+    with a read_error instead of blocking the scan. The pre-filter is
+    conservative: an instrument it skips could not produce a signal anyway.
     """
     if not etoro_env.has_auth():
         return {}
@@ -104,19 +108,28 @@ async def read_markets(config: SessionConfig) -> dict[int, dict[str, Any]]:
     ids = list(config.instruments)
     rates = await client.get_rates(ids)
     markets: dict[int, dict[str, Any]] = {}
+    near_zone: list[int] = []
+    # Pass 1: rates + H1 for everyone.
     for iid in ids:
-        snap: dict[str, Any] = {}
+        snap: dict[str, Any] = {"m15": []}
         if iid in rates:
             snap["ask"], snap["bid"] = rates[iid]
         else:
             snap["read_error"] = "rate unreadable"
-        m15 = await client.get_candles(iid, "FifteenMinutes", CANDLES_M15, M15)
         h1 = await client.get_candles(iid, "OneHour", CANDLES_H1, H1)
-        if m15 is None or h1 is None:
-            snap["read_error"] = snap.get("read_error") or "candles unreadable"
-        snap["m15"] = m15 or []
         snap["h1"] = h1 or []
+        if h1 is None:
+            snap["read_error"] = snap.get("read_error") or "candles unreadable"
+        elif pullback.near_pullback_zone(h1):
+            near_zone.append(iid)
         markets[iid] = snap
+        await asyncio.sleep(SCAN_PAUSE_S)
+    # Pass 2: M15 only for the near-zone candidates.
+    for iid in near_zone:
+        m15 = await client.get_candles(iid, "FifteenMinutes", CANDLES_M15, M15)
+        if m15 is None:
+            markets[iid]["read_error"] = markets[iid].get("read_error") or "candles unreadable"
+        markets[iid]["m15"] = m15 or []
         await asyncio.sleep(SCAN_PAUSE_S)
     return markets
 
@@ -141,12 +154,15 @@ async def evaluate(
     if snap.get("read_error"):
         return {"action": "skip", "reason": f"guardrail: market of {decision.symbol} unreadable"}
     ask, bid = snap["ask"], snap["bid"]
-    if not rules.spread_ok(ask, bid, config):
-        spread_pct = (ask - bid) / ((ask + bid) / 2)
-        return {"action": "skip",
-                "reason": f"guardrail: {decision.symbol} spread {spread_pct:.4%} too wide"}
     direction = decision.direction or "buy"
     entry_rate = ask if direction == "buy" else bid
+    # v2a cost filter: the spread is capped relative to the stop distance.
+    if not rules.spread_ok(ask, bid, entry_rate, decision.stop_rate, config):
+        spread = ask - bid
+        dist = abs(entry_rate - decision.stop_rate)
+        return {"action": "skip",
+                "reason": (f"guardrail: {decision.symbol} spread {spread:.5f} above "
+                           f"{config.max_spread_of_stop:.0%} of the stop distance {dist:.5f}")}
     sizing, reason = rules.size_trade(state["balance"], entry_rate, decision.stop_rate, config)
     if sizing is None:
         return {"action": "skip", "reason": f"guardrail: {reason}"}

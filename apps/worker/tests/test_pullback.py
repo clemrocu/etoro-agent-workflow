@@ -124,6 +124,17 @@ def _():
     assert pullback.analyze(1, m15, h1, 2.0) is None
 
 
+@check("two-pass pre-filter: near_pullback_zone gates the M15 read")
+def _():
+    flat = [candle(100, 100.05, 99.95, 100) for _ in range(220)]
+    assert pullback.near_pullback_zone(flat) is False          # no aligned trend
+    gentle = ramp_h1(slope=0.005)                              # price hugging the EMA20 zone
+    assert pullback.near_pullback_zone(gentle) is True
+    extended = ramp_h1(slope=0.1)                              # price far above the zone
+    assert pullback.near_pullback_zone(extended) is False
+    assert pullback.near_pullback_zone([]) is False            # too short: no trend, no fetch
+
+
 @check("decide_markets: held instrument skipped, best score first")
 def _():
     h1, m15, e20 = pullback_scenario("up")

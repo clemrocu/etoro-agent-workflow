@@ -9,17 +9,23 @@ at 5 % into the caller's account / mirrorId 11759623), token in ETORO_TOKEN.
 
 from pydantic import BaseModel, Field
 
-# Validated eToro instrument ids (eToro Public API, 2026-11-23, all allowOpen,
-# fractional units, min position exposure 1000 USD):
-# FX majors + metals + indices covering the Asia/Europe/US sessions.
+# Validated eToro instrument ids (eToro Public API, 2026-11-23 live checks,
+# all allowOpen, fractional units, min position exposure 1000 USD):
+# FX majors + metals + energy + indices covering the Asia/Europe/US sessions.
+# v2a (2026-11-27): NZDUSD, OIL and SPX500 added (validated 2026-11-23,
+# see knowledge bot-ia-etoro/univers-et-couts.md); PLATINUM stays excluded
+# by the cost verdict.
 DEFAULT_INSTRUMENTS: tuple[int, ...] = (
     1,    # EURUSD
     2,    # GBPUSD
+    3,    # NZDUSD
     4,    # USDCAD
     5,    # USDJPY
     7,    # AUDUSD
+    17,   # OIL (WTI crude)
     18,   # GOLD
     19,   # SILVER
+    27,   # SPX500
     28,   # NSDQ100
     29,   # DJ30
     30,   # UK100
@@ -65,5 +71,7 @@ class SessionConfig(BaseModel):
     min_exposure_usd: float = 1000.0
     allowed_leverages: tuple[int, ...] = (1, 2, 5, 10, 20)
 
-    # costs: only trade instruments whose spread stays narrow
-    max_spread_pct: float = 0.0005          # (ask-bid)/mid <= 0.05 %
+    # costs (v2a, 2026-11-27): per-trade filter, the spread must stay under
+    # a fraction of the structural stop distance R (replaces the flat
+    # 0.05 %-of-price cap: the cost only makes sense relative to the risk)
+    max_spread_of_stop: float = 0.10        # (ask-bid) <= 10 % of |entry - stop|

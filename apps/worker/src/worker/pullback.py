@@ -13,10 +13,16 @@ Signal contract (returned dict, all values rounded by the caller):
 import statistics
 
 UNIVERSE: dict[int, str] = {
-    1: "EURUSD", 2: "GBPUSD", 4: "USDCAD", 5: "USDJPY", 7: "AUDUSD",
-    18: "GOLD", 19: "SILVER", 28: "NSDQ100", 29: "DJ30", 30: "UK100",
-    31: "FRA40", 32: "GER40", 33: "AUS200", 36: "JPN225",
+    1: "EURUSD", 2: "GBPUSD", 3: "NZDUSD", 4: "USDCAD", 5: "USDJPY",
+    7: "AUDUSD", 17: "OIL", 18: "GOLD", 19: "SILVER", 27: "SPX500",
+    28: "NSDQ100", 29: "DJ30", 30: "UK100", 31: "FRA40", 32: "GER40",
+    33: "AUS200", 36: "JPN225",
 }
+
+# v2a two-pass scan: how far from the H1 EMA20 zone the last H1 close may sit
+# before the (paid) M15 read is skipped. Generous on purpose: the pre-filter
+# must never drop an instrument the full analyze() would have signalled.
+NEAR_ZONE_ATR_H1 = 4.0
 
 
 def ema(values: list[float], period: int) -> list[float]:
@@ -82,6 +88,21 @@ def _pullback_zone(side: str, h1: list[dict], a_m15: float) -> tuple[float, floa
     if side == "up":
         return e20 - 1.5 * a_m15, e20 + 0.4 * a_m15
     return e20 + 1.5 * a_m15, e20 - 0.4 * a_m15
+
+
+def near_pullback_zone(h1: list[dict]) -> bool:
+    """Cheap H1-only pre-filter for the v2a two-pass scan: True when the H1
+    trend is aligned and the last close sits within ~NEAR_ZONE_ATR_H1 x ATR(H1)
+    of the EMA20 zone, i.e. when the M15 read can still produce a signal."""
+    side = h1_trend(h1)
+    if side is None:
+        return False
+    a = atr(h1)
+    if a is None or a <= 0:
+        return True  # unreadable volatility: stay conservative, read M15
+    closes = [c["close"] for c in h1]
+    e20 = ema(closes, 20)[-1]
+    return abs(closes[-1] - e20) <= NEAR_ZONE_ATR_H1 * a
 
 
 def analyze(instrument_id: int, m15: list[dict], h1: list[dict], tp_r: float) -> dict | None:
