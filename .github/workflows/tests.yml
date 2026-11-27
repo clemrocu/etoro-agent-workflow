@@ -26,7 +26,7 @@ jobs:
           ./.venv/bin/pip install --disable-pip-version-check --quiet pydantic
           ./.venv/bin/python apps/worker/tests/test_rules.py
           ./.venv/bin/python apps/worker/tests/test_pullback.py
-      - uses: actions/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Frozen-lock sync diagnosis (non-blocking, never fails the job)
         run: |
           set +e
@@ -34,5 +34,6 @@ jobs:
           code=$?
           if [ "$code" -ne 0 ]; then
             echo "::warning::uv sync --frozen exits $code (pre-existing failure kept for diagnosis; the deployment build remains the gate) - tail:"
-            printf '%s\n' "$out" | tail -20
+            printf '%s
+' "$out" | tail -20
           fi
